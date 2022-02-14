@@ -12,9 +12,10 @@ int fcgiMain(FCGX_Stream *in,FCGX_Stream *out,FCGX_Stream *err,FCGX_ParamArray e
 /* Used only in Unix environments, in conjunction with mkstemp(). 
 	Elsewhere (Windows), temporary files go where the tmpnam() 
 	function suggests. If this behavior does not work for you, 
-	modify the getTempFileName() function to suit your needs. */
+	modify the getTempFile() function to suit your needs. */
 
 #define cgicTempDir "/tmp"
+#define cgicMaxTempSize 1073741824
 
 #if CGICDEBUG
 #define CGICDEBUGSTART \
@@ -110,8 +111,8 @@ typedef struct cgiFormEntryStruct {
 	int valueLength;
 	char *fileName;	
 	char *contentType;
-	/* Temporary file name for working storage of file uploads. */
-	char *tfileName;
+	/* Temporary file descriptor for working storage of file uploads. */
+	FILE *tFile;
         struct cgiFormEntryStruct *next;
 } cgiFormEntry;
 
@@ -126,6 +127,10 @@ static void cgiSetupConstants();
 static void cgiFreeResources();
 static int cgiStrEqNc(char *s1, char *s2);
 static int cgiStrBeginsNc(char *s1, char *s2);
+
+#ifdef UNIT_TEST
+static int unitTest();
+#endif
 
 int cgic_main(FCGX_Stream *in,FCGX_Stream *out,FCGX_Stream *err,FCGX_ParamArray envp) {
 
@@ -244,6 +249,7 @@ int cgic_main(FCGX_Stream *in,FCGX_Stream *out,FCGX_Stream *err,FCGX_ParamArray 
 				fprintf(dout, "PostFormInput failed\n");
 				CGICDEBUGEND	
 #endif /* CGICDEBUG */
+				cgiHeaderStatus(500, "Error reading form data");
 				cgiFreeResources();
 				return -1;
 			}	
@@ -264,6 +270,7 @@ int cgic_main(FCGX_Stream *in,FCGX_Stream *out,FCGX_Stream *err,FCGX_ParamArray 
 				fprintf(dout, "PostMultipartInput failed\n");
 				CGICDEBUGEND	
 #endif /* CGICDEBUG */
+				cgiHeaderStatus(500, "Error reading form data");
 				cgiFreeResources();
 				return -1;
 			}	
@@ -283,6 +290,7 @@ int cgic_main(FCGX_Stream *in,FCGX_Stream *out,FCGX_Stream *err,FCGX_ParamArray 
 			fprintf(dout, "GetFormInput failed\n");
 			CGICDEBUGEND	
 #endif /* CGICDEBUG */
+			cgiHeaderStatus(500, "Error reading form data");
 			cgiFreeResources();
 			return -1;
 		} else {	
@@ -293,10 +301,18 @@ int cgic_main(FCGX_Stream *in,FCGX_Stream *out,FCGX_Stream *err,FCGX_ParamArray 
 #endif /* CGICDEBUG */
 		}
 	}
-	result = fcgiMain(in,out,err,envp);
+
+#ifdef UNIT_TEST
+	unitTest();
 	cgiFreeResources();
-	
+	return 0;
+#else
+	result = fcgiMain(in,out,err,envp);
 	return result;
+#endif
+	
+	
+
 }
 
 int main(int argc, char *argv[]) {
@@ -366,6 +382,11 @@ int mpRead(mpStreamPtr mpp, char *buffer, int len)
 {
 	int ilen = len;
 	int got = 0;
+	/* Refuse to read past the declared length in order to
+		avoid deadlock */
+	if (len > (cgiContentLength - mpp->offset)) {
+		len = cgiContentLength - mpp->offset;
+	}
 	while (len) {
 		if (mpp->readPos != mpp->writePos) {
 			*buffer++ = mpp->putback[mpp->readPos++];
@@ -375,11 +396,6 @@ int mpRead(mpStreamPtr mpp, char *buffer, int len)
 		} else {
 			break;
 		}	
-	}
-	/* Refuse to read past the declared length in order to
-		avoid deadlock */
-	if (len > (cgiContentLength - mpp->offset)) {
-		len = cgiContentLength - mpp->offset;
 	}
 	if (len) {
 		int fgot = fread(buffer, 1, len, cgiIn);
@@ -394,6 +410,7 @@ int mpRead(mpStreamPtr mpp, char *buffer, int len)
 			return fgot;
 		}
 	} else if (got) {
+		mpp->offset += got;
 		return got;
 	} else if (ilen) {	
 		return EOF;
@@ -447,13 +464,7 @@ static void decomposeValue(char *value,
 	char **argValues,
 	int argValueSpace);
 
-/* tfileName must be 1024 bytes to ensure adequacy on
-	win32 (1024 exceeds the maximum path length and
-	certainly exceeds observed behavior of _tmpnam).
-	May as well also be 1024 bytes on Unix, although actual
-	length is strlen(cgiTempDir) + a short unique pattern. */
-	
-static cgiParseResultType getTempFileName(char *tfileName);
+static cgiParseResultType getTempFile(FILE **tFile);
 
 static cgiParseResultType cgiParsePostMultipartInput() {
 	cgiParseResultType result;
@@ -461,7 +472,6 @@ static cgiParseResultType cgiParsePostMultipartInput() {
 	int got;
 	FILE *outf = 0;
 	char *out = 0;
-	char tfileName[1024];
 	mpStream mp;
 	mpStreamPtr mpp = &mp;
 	memset(&mp, 0, sizeof(mp));
@@ -532,6 +542,11 @@ static cgiParseResultType cgiParsePostMultipartInput() {
 		}
 		if (!cgiStrEqNc(fvalue, "form-data")) {
 			/* Not form data */	
+			result = afterNextBoundary(mpp, 0, 0, 0, 0);
+			if (result != cgiParseSuccess) {
+				/* Lack of a boundary here is an error. */
+				return result;
+			}
 			continue;
 		}
 		/* Body is everything from here until the next 
@@ -541,20 +556,17 @@ static cgiParseResultType cgiParsePostMultipartInput() {
 			Otherwise, store to a memory buffer (it is
 			presumably a regular form field). */
 		if (strlen(ffileName)) {
-			if (getTempFileName(tfileName) != cgiParseSuccess) {
+			if (getTempFile(&outf) != cgiParseSuccess) {
 				return cgiParseIO;
 			}	
-			outf = fopen(tfileName, "w+b");
 		} else {
 			outf = 0;
-			tfileName[0] = '\0';
 		}	
 		result = afterNextBoundary(mpp, outf, &out, &bodyLength, 0);
 		if (result != cgiParseSuccess) {
 			/* Lack of a boundary here is an error. */
 			if (outf) {
 				fclose(outf);
-				unlink(tfileName);
 			}
 			if (out) {
 				free(out);
@@ -583,7 +595,6 @@ static cgiParseResultType cgiParsePostMultipartInput() {
 				goto outOfMemory;
 			}
 			n->value[0] = '\0';
-			fclose(outf);
 		}
 		n->valueLength = bodyLength;
 		n->next = 0;
@@ -602,11 +613,12 @@ static cgiParseResultType cgiParsePostMultipartInput() {
 			goto outOfMemory;
 		}
 		strcpy(n->contentType, fcontentType);
-		n->tfileName = (char *) malloc(strlen(tfileName) + 1);
-		if (!n->tfileName) {
-			goto outOfMemory;
+	
+		if(outf)
+		{
+			n->tFile = fdopen (dup (fileno (outf)), "w+b");
+			fclose(outf);
 		}
-		strcpy(n->tfileName, tfileName);
 
 		l = n;			
 	}	
@@ -622,8 +634,8 @@ outOfMemory:
 		if (n->fileName) {
 			free(n->fileName);
 		}
-		if (n->tfileName) {
-			free(n->tfileName);
+		if (n->tFile) {
+			fclose(n->tFile);
 		}
 		if (n->contentType) {
 			free(n->contentType);
@@ -635,13 +647,19 @@ outOfMemory:
 	}
 	if (outf) {
 		fclose(outf);
-		unlink(tfileName);
 	}
 	return cgiParseMemory;
 }
 
-static cgiParseResultType getTempFileName(char *tfileName)
+static cgiParseResultType getTempFile(FILE **tFile)
 {
+	/* tfileName must be 1024 bytes to ensure adequacy on
+		win32 (1024 exceeds the maximum path length and
+		certainly exceeds observed behavior of _tmpnam).
+		May as well also be 1024 bytes on Unix, although actual
+		length is strlen(cgiTempDir) + a short unique pattern. */
+	char tfileName[1024];
+	
 #ifndef WIN32
 	/* Unix. Use the robust 'mkstemp' function to create
 		a temporary file that is truly unique, with
@@ -669,6 +687,8 @@ static cgiParseResultType getTempFileName(char *tfileName)
 		return cgiParseIO;
 	}
 #endif
+	*tFile = fopen(tfileName, "w+b");
+	unlink(tfileName);
 	return cgiParseSuccess;
 }
 
@@ -765,7 +785,10 @@ cgiParseResultType afterNextBoundary(mpStreamPtr mpp, FILE *outf, char **outP,
 			/* Not presently in the middle of a boundary
 				match; just emit the character. */
 			BAPPEND(d[0]);
-		}	
+		}
+		if(outLen > cgicMaxTempSize) {
+			goto outOfMemory;
+		}
 	}
 	/* Read trailing newline or -- EOF marker. A literal EOF here
 		would be an error in the input stream. */
@@ -803,7 +826,7 @@ outOfMemory:
 		if (out) {
 			free(out);
 		}
-		*outP = '\0';	
+		*outP = 0;	
 	}
 error:
 	if (bodyLengthP) {
@@ -920,7 +943,9 @@ static void decomposeValue(char *value,
 			}	
 		}	
 		if (argValueSpace) {
-			argValue[argValueLen] = '\0';
+			if (argValue) {
+				argValue[argValueLen] = '\0';
+			}
 		}
 	}	 	
 }
@@ -1009,22 +1034,25 @@ static cgiParseResultType cgiParseFormInput(char *data, int length) {
 	cgiFormEntry *n;
 	cgiFormEntry *l = 0;
 	while (pos != length) {
-		int foundEq = 0;
 		int foundAmp = 0;
 		int start = pos;
 		int len = 0;
 		char *attr;
 		char *value;
 		while (pos != length) {
+			if (data[pos] == '&') {
+				/* Tolerate attr name without a value. This will fall through
+					and give us an empty value */
+				break;
+			}
 			if (data[pos] == '=') {
-				foundEq = 1;
 				pos++;
 				break;
 			}
 			pos++;
 			len++;
 		}
-		if (!foundEq) {
+		if (!len) {
 			break;
 		}
 		if (cgiUnescapeChars(&attr, data+start, len)
@@ -1076,16 +1104,6 @@ static cgiParseResultType cgiParseFormInput(char *data, int length) {
 			return cgiParseMemory;
 		}	
 		n->contentType[0] = '\0';
-		n->tfileName = (char *) malloc(1);
-		if (!n->tfileName) {
-			free(attr);
-			free(value);
-			free(n->fileName);
-			free(n->contentType);
-			free(n);
-			return cgiParseMemory;
-		}	
-		n->tfileName[0] = '\0';
 		n->next = 0;
 		if (!l) {
 			cgiFormEntryFirst = n;
@@ -1179,10 +1197,9 @@ static void cgiFreeResources() {
 		free(c->value);
 		free(c->fileName);
 		free(c->contentType);
-		if (strlen(c->tfileName)) {
-			unlink(c->tfileName);
+		if (c->tFile) {
+			fclose(c->tFile);
 		}
-		free(c->tfileName);
 		free(c);
 		c = n;
 	}
@@ -1300,7 +1317,7 @@ cgiFormResultType cgiFormFileSize(
 			*sizeP = 0;
 		}
 		return cgiFormNotFound;
-	} else if (!strlen(e->tfileName)) {
+	} else if (!e->tFile) {
 		if (sizeP) {
 			*sizeP = 0;
 		}
@@ -1327,7 +1344,7 @@ cgiFormResultType cgiFormFileOpen(
 		*cfpp = 0;
 		return cgiFormNotFound;
 	}
-	if (!strlen(e->tfileName)) {
+	if (!e->tFile) {
 		*cfpp = 0;
 		return cgiFormNotAFile;
 	}
@@ -1336,7 +1353,8 @@ cgiFormResultType cgiFormFileOpen(
 		*cfpp = 0;
 		return cgiFormMemory;
 	}
-	cfp->in = fopen(e->tfileName, "rb");
+	cfp->in = fdopen(dup(fileno(e->tFile)), "rb");
+	rewind(cfp->in);
 	if (!cfp->in) {
 		free(cfp);
 		return cgiFormIO;
@@ -1740,7 +1758,7 @@ cgiFormResultType cgiCookieString(
 			genuine security concern. Thanks to Nicolas 
 			Tomadakis. */
 		while (*p == *n) {
-			if ((p == '\0') && (n == '\0')) {
+			if ((*p == '\0') && (*n == '\0')) {
 				/* Malformed cookie header from client */
 				return cgiFormNotFound;
 			}
@@ -1792,6 +1810,7 @@ cgiFormResultType cgiCookieString(
 	}
 	/* 2.01: actually the above loop never terminates except
 		with a return, but do this to placate gcc */
+	/* Actually, it can, so this is real. */
 	if (space) {
 		*value = '\0';
 	}
@@ -1819,10 +1838,10 @@ void cgiHeaderCookieSetInteger(char *name, int value, int secondsToLive,
 {
 	char svalue[256];
 	sprintf(svalue, "%d", value);
-	cgiHeaderCookieSetString(name, svalue, secondsToLive, path, domain);
+	cgiHeaderCookieSet(name, svalue, secondsToLive, path, domain, 0);
 }
 
-char *days[] = {
+static char *days[] = {
 	"Sun",
 	"Mon",
 	"Tue",
@@ -1832,7 +1851,7 @@ char *days[] = {
 	"Sat"
 };
 
-char *months[] = {
+static char *months[] = {
 	"Jan",
 	"Feb",
 	"Mar",
@@ -1847,8 +1866,8 @@ char *months[] = {
 	"Dec"
 };
 
-void cgiHeaderCookieSetString(char *name, char *value, int secondsToLive,
-	char *path, char *domain)
+void cgiHeaderCookieSet(char *name, char *value, int secondsToLive,
+	char *path, char *domain, int options)
 {
 	/* cgic 2.02: simpler and more widely compatible implementation.
 		Thanks to Chunfu Lai. 
@@ -1867,7 +1886,7 @@ void cgiHeaderCookieSetString(char *name, char *value, int secondsToLive,
 	then = now + secondsToLive;
 	gt = gmtime(&then);
 	fprintf(cgiOut, 
-		"Set-Cookie: %s=%s; domain=%s; expires=%s, %02d-%s-%04d %02d:%02d:%02d GMT; path=%s\r\n",
+		"Set-Cookie: %s=%s; domain=%s; expires=%s, %02d-%s-%04d %02d:%02d:%02d GMT; path=%s%s%s%s\r\n",
 		name, value, domain, 
 		days[gt->tm_wday],
 		gt->tm_mday,
@@ -1876,7 +1895,16 @@ void cgiHeaderCookieSetString(char *name, char *value, int secondsToLive,
 		gt->tm_hour,
 		gt->tm_min,
 		gt->tm_sec,
-		path);
+		path,
+		((options & cgiCookieSecure) ? "; Secure" : ""),
+		((options & cgiCookieHttpOnly) ? "; HttpOnly" : ""),
+		((options & cgiCookieSameSiteStrict) ? "; SameSite=Strict" : ""));
+}
+
+void cgiHeaderCookieSetString(char *name, char *value, int secondsToLive,
+	char *path, char *domain)
+{
+	cgiHeaderCookieSet(name, value, secondsToLive, path, domain, 0);
 }
 
 void cgiHeaderLocation(char *redirectUrl) {
@@ -2168,18 +2196,12 @@ cgiEnvironmentResultType cgiReadEnvironment(char *filename) {
 		}
 		if (fileFlag) {
 			char buffer[1024];
-			FILE *out;
-			char tfileName[1024];
+			FILE *out = NULL;
 			int got;
 			int len = e->valueLength;
-			if (getTempFileName(tfileName)
-				!= cgiParseSuccess)
+			if (getTempFile(&out)
+				!= cgiParseSuccess || !out)
 			{
-				result = cgiEnvironmentIO;
-				goto error;
-			}
-			out = fopen(tfileName, "w+b");
-			if (!out) {
 				result = cgiEnvironmentIO;
 				goto error;
 			}
@@ -2195,32 +2217,19 @@ cgiEnvironmentResultType cgiReadEnvironment(char *filename) {
 				if (got <= 0) {
 					result = cgiEnvironmentIO;
 					fclose(out);
-					unlink(tfileName);
 					goto error;
 				}
 				if (((int) fwrite(buffer, 1, got, out)) != got) {
 					result = cgiEnvironmentIO;
 					fclose(out);
-					unlink(tfileName);
 					goto error;
 				}
 				len -= got;
 			}
 			/* cgic 2.05: should be fclose not rewind */
-			fclose(out);
-			e->tfileName = (char *) malloc((int) strlen(tfileName) + 1);
-			if (!e->tfileName) {
-				result = cgiEnvironmentMemory;
-				unlink(tfileName);
-				goto error;
-			}
-			strcpy(e->tfileName, tfileName);
+			e->tFile = out;
 		} else {
-			e->tfileName = (char *) malloc(1);
-			if (!e->tfileName) {
-				result = cgiEnvironmentMemory;
-				goto error;
-			}
+			e->tFile = NULL;
 		}	
 		e->next = 0;
 		if (p) {
@@ -2251,8 +2260,8 @@ error:
 		if (e->contentType) {
 			free(e->contentType);
 		}
-		if (e->tfileName) {
-			free(e->tfileName);
+		if (e->tFile) {
+			fclose(e->tFile);
 		}
 		free(e);
 	}
@@ -2453,7 +2462,7 @@ skipSecondValue:
 	e = cgiFormEntryFirst;
 	i = 0;
 	while (e) {
-		int space;
+		size_t space;
 		/* Don't return a field name more than once if
 			multiple values happen to be present for it */
 		pe = cgiFormEntryFirst;
@@ -2463,7 +2472,7 @@ skipSecondValue:
 			}
 			pe = pe->next;					
 		}		
-		space = (int) strlen(e->attr) + 1;
+		space = strlen(e->attr) + 1;
 		stringArray[i] = (char *) malloc(space);
 		if (stringArray[i] == 0) {
 			/* Memory problems */
@@ -2487,7 +2496,7 @@ skipSecondValue2:
 		} \
 	} 
 
-cgiFormResultType cgiHtmlEscapeData(char *data, int len)
+cgiFormResultType cgiHtmlEscapeData(const char *data, int len)
 {
 	while (len--) {
 		if (*data == '<') {
@@ -2514,7 +2523,7 @@ cgiFormResultType cgiHtmlEscapeData(char *data, int len)
 	return cgiFormSuccess;
 }
 
-cgiFormResultType cgiHtmlEscape(char *s)
+cgiFormResultType cgiHtmlEscape(const char *s)
 {
 	return cgiHtmlEscapeData(s, (int) strlen(s));
 }
@@ -2525,7 +2534,7 @@ cgiFormResultType cgiHtmlEscape(char *s)
 	'data' is not null-terminated; 'len' is the number of
 	bytes in 'data'. Returns cgiFormIO in the event
 	of error, cgiFormSuccess otherwise. */
-cgiFormResultType cgiValueEscapeData(char *data, int len)
+cgiFormResultType cgiValueEscapeData(const char *data, int len)
 {
 	while (len--) {
 		if (*data == '\"') {
@@ -2542,8 +2551,52 @@ cgiFormResultType cgiValueEscapeData(char *data, int len)
 	return cgiFormSuccess;
 }
 
-cgiFormResultType cgiValueEscape(char *s)
+cgiFormResultType cgiValueEscape(const char *s)
 {
 	return cgiValueEscapeData(s, (int) strlen(s));
 }
 
+
+#ifdef UNIT_TEST
+
+static void unitTestAssert(const int value, const char *message);
+
+static int unitTest() {
+	char *input = "one=1&two=2&empty1&four=4&empty2";
+	cgiFormEntry *e;
+	cgiParseResultType result = cgiParseFormInput(input, strlen(input));
+	unitTestAssert(result == cgiParseSuccess, "cgiParseFormInput did not return cgiParseSuccess");
+	e = cgiFormEntryFirst;
+	unitTestAssert(!!e, "first entry missing");
+	unitTestAssert(!strcmp(e->attr, "one"), "first entry name is not one");
+	unitTestAssert(!strcmp(e->value, "1"), "first entry value is not 1");
+	e = e->next;
+	unitTestAssert(!!e, "Test failed: second entry missing");
+	unitTestAssert(!strcmp(e->attr, "two"), "second entry name is not two");
+	unitTestAssert(!strcmp(e->value, "2"), "second entry value is not 2");
+	e = e->next;
+	unitTestAssert(!!e, "Test failed: third entry missing");
+	unitTestAssert(!strcmp(e->attr, "empty1"), "third entry name is not empty1");
+	unitTestAssert(!strcmp(e->value, ""), "third entry value is not empty string");
+	e = e->next;
+	unitTestAssert(!!e, "Test failed: fourth entry missing");
+	unitTestAssert(!strcmp(e->attr, "four"), "fourth entry name is not four");
+	unitTestAssert(!strcmp(e->value, "4"), "fourth entry value is not 4");
+	e = e->next;
+	unitTestAssert(!!e, "Test failed: fifth entry missing");
+	unitTestAssert(!strcmp(e->attr, "empty2"), "fifth entry name is not empty2");
+	unitTestAssert(!strcmp(e->value, ""), "fifth entry value is not empty string");
+	unitTestAssert(!e->next, "unexpected entry at end of list");
+	return 0;
+}
+
+static void unitTestAssert(const int value, const char *message)
+{
+	if (value) {
+		return;
+	}
+	fprintf(stderr, "Test failed: %s\n", message);
+	exit(1);
+}
+
+#endif
